@@ -23,14 +23,11 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* Card border for st.container(border=True) */
 [data-testid="stVerticalBlockBorderWrapper"]{
     border: 3px solid #000 !important;
-    border-radius: 0px !important;
     padding: 14px !important;
 }
 .block-container { padding-top: 1.2rem; }
-[data-testid="stMetricLabel"] p { font-size: 0.9rem; }
 h2, h3 { margin-bottom: 0.4rem; }
 </style>
 """,
@@ -39,6 +36,11 @@ h2, h3 { margin-bottom: 0.4rem; }
 
 APP_DIR = Path(__file__).parent
 DEFAULT_XLSX = str(APP_DIR / "sample_datasets.xlsx")
+
+MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+QUARTER_ORDER = ["Q1", "Q2", "Q3", "Q4"]
+
+YEAR_COLOR_MAP = {"2022": "#5DA9E9", "2023": "#F28E2B", "2024": "#59A14F", "2025": "#E15759"}
 
 US_STATE_ABBR = {
     "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
@@ -54,40 +56,24 @@ US_STATE_ABBR = {
     "District of Columbia": "DC",
 }
 
-YEAR_COLOR_MAP = {
-    "2022": "#5DA9E9",
-    "2023": "#F28E2B",
-    "2024": "#59A14F",
-    "2025": "#E15759",
-}
-
-MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def time_bucket(dt_series: pd.Series, granularity: str) -> pd.Series:
-    dt = pd.to_datetime(dt_series, errors="coerce")
-    if granularity == "Daily":
-        return dt.dt.to_period("D").dt.to_timestamp()
-    if granularity == "Weekly":
-        return dt.dt.to_period("W").dt.start_time
-    if granularity == "Monthly":
-        return dt.dt.to_period("M").dt.to_timestamp()
-    if granularity == "Quarterly":
-        return dt.dt.to_period("Q").dt.start_time
-    return dt.dt.to_period("M").dt.to_timestamp()
-
-
-def safe_pct(numer: float, denom: float) -> float:
-    return float(numer / denom) if denom else 0.0
+def drop_unnamed(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in df.columns if str(c).startswith("Unnamed")]
+    return df.drop(columns=cols, errors="ignore")
 
 
 def safe_div_series(numer: pd.Series, denom: pd.Series) -> pd.Series:
     denom = denom.replace(0, np.nan)
     return (numer / denom).fillna(0.0)
+
+
+def fmt_money(x: float) -> str:
+    if pd.isna(x):
+        return "$0"
+    return f"${x:,.0f}"
 
 
 def normalize_state_to_abbr(series: pd.Series) -> pd.Series:
@@ -98,125 +84,159 @@ def normalize_state_to_abbr(series: pd.Series) -> pd.Series:
     return s
 
 
-def drop_partial_first_week(df: pd.DataFrame, date_col: str, bucket_col: str) -> pd.DataFrame:
+def pick_yoy_years(years_present: list[str]) -> list[str]:
+    years_present = sorted([str(y) for y in years_present])
+    if "2022" in years_present and "2023" in years_present:
+        return ["2022", "2023"]
+    return years_present[-2:] if len(years_present) >= 2 else years_present
+
+
+def add_time_cols(
+    df: pd.DataFrame,
+    date_col: str = "submit_date",
+    granularity: str = "Monthly",
+) -> pd.DataFrame:
     """
-    Weekly bucketing can create a partial first week (few days) causing an artificial spike.
-    Remove the first bucket if it covers < 7 days.
+    Adds:
+      - year (string)
+      - period_num (used for sorting within year)
+      - period (label shown on x-axis)
+    Supported granularities: Daily, Weekly, Monthly, Quarterly
     """
-    if df.empty or bucket_col not in df.columns or date_col not in df.columns:
-        return df
+    out = df.copy()
+    out["year"] = out[date_col].dt.year.astype(str)
 
-    cov = (
-        df.dropna(subset=[bucket_col, date_col])
-        .groupby(bucket_col)[date_col]
-        .agg(min_dt="min", max_dt="max")
-        .sort_index()
-        .reset_index()
-    )
-    if len(cov) <= 1:
-        return df
+    if granularity == "Daily":
+        # Keep date label for axis; use dayofyear for within-year sort
+        out["period_num"] = out[date_col].dt.dayofyear
+        out["period"] = out[date_col].dt.strftime("%Y-%m-%d")
 
-    first_bucket = cov.iloc[0][bucket_col]
-    coverage_days = (cov.iloc[0]["max_dt"] - cov.iloc[0]["min_dt"]).days + 1
+    elif granularity == "Weekly":
+        # ISO week (1-53); label W##
+        iso = out[date_col].dt.isocalendar()
+        out["period_num"] = iso.week.astype(int)
+        out["period"] = iso.week.astype(str).radd("W")
 
-    if coverage_days < 7:
-        return df[df[bucket_col] != first_bucket].copy()
+        # NOTE: If you include cross-year comparisons, ISO weeks can overlap.
+        # We keep "year" from the date, which is OK for most dashboards.
 
-    return df
+    elif granularity == "Quarterly":
+        out["period_num"] = out[date_col].dt.quarter
+        out["period"] = out["period_num"].map(lambda q: f"Q{int(q)}")
+
+    else:  # Monthly
+        out["period_num"] = out[date_col].dt.month
+        out["period"] = out["period_num"].map(lambda m: calendar.month_abbr[int(m)])
+
+    return out
 
 
-def month_label(m: int) -> str:
-    return calendar.month_abbr[int(m)]  # 1 -> Jan
-
-
-def fmt_money(x: float) -> str:
-    if pd.isna(x):
-        return "$0"
-    return f"${x:,.0f}"
+def detect_id_col(df: pd.DataFrame) -> str:
+    for c in ["application_id", "id", "app_id", "applicationid"]:
+        if c in df.columns:
+            return c
+    return ""
 
 
 # -----------------------------
-# Load data (marketing join: customers.campaign -> marketing.id)
+# Load data (robust + avoids merge collisions)
 # -----------------------------
 @st.cache_data(show_spinner=True)
-def load_data(xlsx_path: str):
-    customers = pd.read_excel(xlsx_path, sheet_name="customers")
-    applications = pd.read_excel(xlsx_path, sheet_name="applications")
-    stores = pd.read_excel(xlsx_path, sheet_name="stores")
-    marketing = pd.read_excel(xlsx_path, sheet_name="marketing")
+def load_data(xlsx_path: str) -> pd.DataFrame:
+    customers = drop_unnamed(pd.read_excel(xlsx_path, sheet_name="customers"))
+    applications = drop_unnamed(pd.read_excel(xlsx_path, sheet_name="applications"))
+    stores = drop_unnamed(pd.read_excel(xlsx_path, sheet_name="stores"))
+    marketing = drop_unnamed(pd.read_excel(xlsx_path, sheet_name="marketing"))
 
-    for df in (customers, applications, stores, marketing):
-        unnamed = [c for c in df.columns if str(c).startswith("Unnamed")]
-        if unnamed:
-            df.drop(columns=unnamed, inplace=True)
+    # Ensure application_id exists
+    app_id_col = detect_id_col(applications)
+    if not app_id_col:
+        applications = applications.reset_index().rename(columns={"index": "application_id"})
+        app_id_col = "application_id"
+    elif app_id_col != "application_id":
+        applications = applications.rename(columns={app_id_col: "application_id"})
 
     # Dates
     applications["submit_date"] = pd.to_datetime(applications.get("submit_date"), errors="coerce")
     applications["approved_date"] = pd.to_datetime(applications.get("approved_date"), errors="coerce")
-    marketing["start_date"] = pd.to_datetime(marketing.get("start_date"), errors="coerce")
-    marketing["end_date"] = pd.to_datetime(marketing.get("end_date"), errors="coerce")
 
-    # Core fields
-    applications["is_approved"] = applications.get("approved", False).fillna(False).astype(bool)
+    # Flags + amounts
+    applications["approved"] = applications.get("approved", False).fillna(False).astype(bool)
     applications["approved_amount"] = pd.to_numeric(applications.get("approved_amount", 0), errors="coerce").fillna(0.0)
     applications["dollars_used"] = pd.to_numeric(applications.get("dollars_used", 0), errors="coerce").fillna(0.0)
+
     applications["is_used"] = applications["dollars_used"] > 0
+    applications["is_approved"] = applications["approved"]
 
-    # Join to customers and stores
-    apps = applications.merge(customers, on="customer_id", how="left", suffixes=("", "_cust"))
-    apps = apps.merge(stores, on="store", how="left", suffixes=("", "_store"))
+    # Slim tables (avoid collisions)
+    cust_cols = [c for c in ["customer_id", "campaign"] if c in customers.columns]
+    customers_slim = customers[cust_cols].copy() if cust_cols else customers[["customer_id"]].copy()
 
-    # Marketing join: customers.campaign (id) -> marketing.id
-    if "campaign" in apps.columns and "id" in marketing.columns:
-        marketing_ren = marketing.rename(
-            columns={
-                "name": "campaign_name",
-                "spend": "campaign_spend",
-                "start_date": "campaign_start_date",
-                "end_date": "campaign_end_date",
-            }
+    store_cols = [c for c in ["store", "state", "industry", "size"] if c in stores.columns]
+    stores_slim = stores[store_cols].copy() if store_cols else stores[["store"]].copy()
+
+    mkt_cols = [c for c in ["id", "name", "spend", "start_date", "end_date"] if c in marketing.columns]
+    marketing_slim = marketing[mkt_cols].copy().rename(
+        columns={
+            "id": "campaign_id",
+            "name": "campaign_name",
+            "spend": "campaign_spend",
+            "start_date": "campaign_start_date",
+            "end_date": "campaign_end_date",
+        }
+    )
+    marketing_slim["campaign_start_date"] = pd.to_datetime(marketing_slim.get("campaign_start_date"), errors="coerce")
+    marketing_slim["campaign_end_date"] = pd.to_datetime(marketing_slim.get("campaign_end_date"), errors="coerce")
+    marketing_slim["campaign_spend"] = pd.to_numeric(marketing_slim.get("campaign_spend", 0), errors="coerce").fillna(0.0)
+
+    # Merge
+    df = applications.merge(customers_slim, on="customer_id", how="left")
+    df = df.merge(stores_slim, on="store", how="left")
+
+    if "campaign" in df.columns and "campaign_id" in marketing_slim.columns:
+        df = (
+            df.merge(
+                marketing_slim,
+                left_on="campaign",
+                right_on="campaign_id",
+                how="left",
+            )
+            .drop(columns=["campaign_id"], errors="ignore")
         )
-        apps = apps.merge(
-            marketing_ren[["id", "campaign_name", "campaign_spend", "campaign_start_date", "campaign_end_date"]],
-            left_on="campaign",
-            right_on="id",
-            how="left",
-        )
-        apps.drop(columns=["id"], inplace=True, errors="ignore")
 
-    return customers, applications, stores, marketing, apps
+    # State abbrev
+    if "state" in df.columns:
+        df["state_abbr"] = normalize_state_to_abbr(df["state"])
+
+    return df
 
 
 # -----------------------------
-# Title
+# Header
 # -----------------------------
 st.title("Snap Finance — Application Performance Dashboard")
-st.caption("Applications → Approvals → Usage, plus amount trends and geographic distribution.")
+st.caption("Applications → Approvals → Usage, plus amount trends and campaign performance.")
 
 
 # -----------------------------
-# Sidebar controls
+# Sidebar / filters
 # -----------------------------
 with st.sidebar:
     st.header("Data")
-    xlsx_path = st.text_input("Path to sample_datasets.xlsx", str(DEFAULT_XLSX))
+    xlsx_path = st.text_input("Path to sample_datasets.xlsx", DEFAULT_XLSX)
 
     try:
-        customers, applications, stores, marketing, apps = load_data(xlsx_path)
+        df_all = load_data(xlsx_path)
     except FileNotFoundError:
-        st.error(
-            "File not found.\n\n"
-            "Fix: Put `sample_datasets.xlsx` in the same folder as `app.py`, "
-            "or paste the full path here."
-        )
+        st.error("File not found. Put `sample_datasets.xlsx` next to `app.py` or paste full path.")
         st.stop()
 
     st.header("Filters")
 
-    min_dt = apps["submit_date"].min()
-    max_dt = apps["submit_date"].max()
+    min_dt = df_all["submit_date"].min()
+    max_dt = df_all["submit_date"].max()
     if pd.isna(min_dt) or pd.isna(max_dt):
-        st.error("submit_date is missing/invalid in the dataset.")
+        st.error("submit_date is missing/invalid.")
         st.stop()
 
     date_range = st.date_input(
@@ -226,14 +246,8 @@ with st.sidebar:
         max_value=max_dt.date(),
     )
 
-    granularity = st.selectbox(
-        "Trend granularity",
-        ["Daily", "Weekly", "Monthly", "Quarterly"],
-        index=1,
-    )
-
     def opts(col: str):
-        return sorted([x for x in apps[col].dropna().unique()]) if col in apps.columns else []
+        return sorted([x for x in df_all[col].dropna().unique()]) if col in df_all.columns else []
 
     states = st.multiselect("State", opts("state"), default=[])
     industries = st.multiselect("Industry", opts("industry"), default=[])
@@ -243,45 +257,50 @@ with st.sidebar:
 
     map_theme = st.selectbox("Map theme", ["Auto", "Dark"], index=1)
 
+    # ✅ NEW: Trend granularity (Daily/Weekly/Monthly/Quarterly)
+    trend_granularity = st.selectbox(
+        "Trend granularity",
+        ["Daily", "Weekly", "Monthly", "Quarterly"],
+        index=2,  # Monthly default
+    )
 
-# -----------------------------
-# Apply filters
-# -----------------------------
+# Optional UX tip
+if trend_granularity == "Daily":
+    st.info("Tip: Daily trends work best with a shorter date range (e.g., ≤ 90 days).")
+
+# apply filters
 start_date, end_date = date_range
-mask = (apps["submit_date"].dt.date >= start_date) & (apps["submit_date"].dt.date <= end_date)
 
-if states and "state" in apps.columns:
-    mask &= apps["state"].isin(states)
-if industries and "industry" in apps.columns:
-    mask &= apps["industry"].isin(industries)
-if sizes and "size" in apps.columns:
-    mask &= apps["size"].isin(sizes)
-if stores_sel and "store" in apps.columns:
-    mask &= apps["store"].isin(stores_sel)
-if campaigns and "campaign_name" in apps.columns:
-    mask &= apps["campaign_name"].isin(campaigns)
+mask = (df_all["submit_date"].dt.date >= start_date) & (df_all["submit_date"].dt.date <= end_date)
 
-f = apps.loc[mask].copy()
+if states and "state" in df_all.columns:
+    mask &= df_all["state"].isin(states)
+if industries and "industry" in df_all.columns:
+    mask &= df_all["industry"].isin(industries)
+if sizes and "size" in df_all.columns:
+    mask &= df_all["size"].isin(sizes)
+if stores_sel and "store" in df_all.columns:
+    mask &= df_all["store"].isin(stores_sel)
+if campaigns and "campaign_name" in df_all.columns:
+    mask &= df_all["campaign_name"].isin(campaigns)
 
-if f.empty:
-    st.warning("No data matches your filters. Please widen the date range or clear filters.")
-    st.stop()
-
-f["state_abbr"] = normalize_state_to_abbr(f["state"]) if "state" in f.columns else np.nan
-f["bucket"] = time_bucket(f["submit_date"], granularity)
-
-# Weekly spike fix for bucketed charts
-if granularity == "Weekly":
-    f = drop_partial_first_week(f, date_col="submit_date", bucket_col="bucket")
+f = df_all.loc[mask].copy()
 
 if f.empty:
-    st.warning("No data remains after weekly partial-week cleanup. Try a wider date range.")
+    st.warning("No data matches your filters.")
     st.stop()
 
+# category ordering only for Monthly/Quarterly; for Daily/Weekly let Plotly keep natural order
+if trend_granularity == "Quarterly":
+    period_order = QUARTER_ORDER
+elif trend_granularity == "Monthly":
+    period_order = MONTH_ORDER
+else:
+    period_order = None
 
-# -----------------------------
-# KPI strip (NO green deltas)
-# -----------------------------
+period_category_orders = {"period": period_order} if period_order else {}
+
+# KPI row
 total_apps = int(len(f))
 approved_apps = int(f["is_approved"].sum())
 used_apps = int(f["is_used"].sum())
@@ -297,43 +316,24 @@ st.divider()
 
 
 # =========================================================
-# TASK 1 — Month-aligned YoY lines
+# TASK 1
 # =========================================================
 st.subheader("Task 1 — Trends (Applications, Approved, Used)")
 
-t1_base = f.dropna(subset=["submit_date"]).copy()
-t1_base["year"] = t1_base["submit_date"].dt.year.astype(str)
-t1_base["month_num"] = t1_base["submit_date"].dt.month
+t1 = add_time_cols(f, "submit_date", trend_granularity)
+years_to_show = pick_yoy_years(t1["year"].unique().tolist())
+t1 = t1[t1["year"].isin(years_to_show)].copy()
+t1["year"] = pd.Categorical(t1["year"], categories=years_to_show, ordered=True)
 
-years_present = sorted(t1_base["year"].unique())
-years_to_show = years_present[-2:] if len(years_present) > 2 else years_present
-
-preferred_order = [y for y in ["2022", "2023"] if y in years_to_show] + [
-    y for y in years_to_show if y not in ["2022", "2023"]
-]
-t1_base = t1_base[t1_base["year"].isin(years_to_show)].copy()
-t1_base["year"] = pd.Categorical(t1_base["year"], categories=preferred_order, ordered=True)
-
-t1_apps = (
-    t1_base.groupby(["year", "month_num"], observed=True, as_index=False)
-    .agg(applications=("application_id", "count"))
+t1_agg = (
+    t1.groupby(["year", "period_num", "period"], observed=True, as_index=False)
+    .agg(
+        applications=("application_id", "count"),
+        approved=("is_approved", "sum"),
+        used=("is_used", "sum"),
+    )
+    .sort_values(["year", "period_num"])
 )
-t1_apps["month"] = t1_apps["month_num"].map(lambda m: calendar.month_abbr[int(m)])
-
-t1_appr = (
-    t1_base.groupby(["year", "month_num"], observed=True, as_index=False)
-    .agg(approved=("is_approved", "sum"))
-)
-t1_appr["month"] = t1_appr["month_num"].map(lambda m: calendar.month_abbr[int(m)])
-
-t1_used = (
-    t1_base.groupby(["year", "month_num"], observed=True, as_index=False)
-    .agg(used=("is_used", "sum"))
-)
-t1_used["month"] = t1_used["month_num"].map(lambda m: calendar.month_abbr[int(m)])
-
-color_map = {y: YEAR_COLOR_MAP.get(str(y), None) for y in preferred_order}
-color_map = {k: v for k, v in color_map.items() if v}
 
 c1, c2, c3 = st.columns(3)
 
@@ -341,65 +341,67 @@ with c1:
     with st.container(border=True):
         st.markdown("### # of Application")
         fig = px.line(
-            t1_apps.sort_values(["year", "month_num"]),
-            x="month",
+            t1_agg,
+            x="period",
             y="applications",
             color="year",
             markers=True,
-            category_orders={"month": MONTH_ORDER},
-            color_discrete_map=color_map if color_map else None,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
         )
-        fig.update_layout(height=260, hovermode="x unified", legend_title_text="Year",
-                          margin=dict(l=10, r=10, t=10, b=10))
+        fig.update_layout(height=260, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 with c2:
     with st.container(border=True):
         st.markdown("### # of Approved")
         fig = px.line(
-            t1_appr.sort_values(["year", "month_num"]),
-            x="month",
+            t1_agg,
+            x="period",
             y="approved",
             color="year",
             markers=True,
-            category_orders={"month": MONTH_ORDER},
-            color_discrete_map=color_map if color_map else None,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
         )
-        fig.update_layout(height=260, hovermode="x unified", legend_title_text="Year",
-                          margin=dict(l=10, r=10, t=10, b=10))
+        fig.update_layout(height=260, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 with c3:
     with st.container(border=True):
-        st.markdown("### # of Used Application")
+        st.markdown("### # of Used Applications")
         fig = px.line(
-            t1_used.sort_values(["year", "month_num"]),
-            x="month",
+            t1_agg,
+            x="period",
             y="used",
             color="year",
             markers=True,
-            category_orders={"month": MONTH_ORDER},
-            color_discrete_map=color_map if color_map else None,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
         )
-        fig.update_layout(height=260, hovermode="x unified", legend_title_text="Year",
-                          margin=dict(l=10, r=10, t=10, b=10))
+        fig.update_layout(height=260, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
 
 # =========================================================
-# TASK 2 — Avg amount trends
+# TASK 2
 # =========================================================
 st.subheader("Task 2 — Avg Approved Amount & Avg Used Amount Trends")
 
-t2 = (
-    f.groupby("bucket", as_index=False)
+t2 = add_time_cols(f, "submit_date", trend_granularity)
+years_to_show_t2 = pick_yoy_years(t2["year"].unique().tolist())
+t2 = t2[t2["year"].isin(years_to_show_t2)].copy()
+t2["year"] = pd.Categorical(t2["year"], categories=years_to_show_t2, ordered=True)
+
+t2_agg = (
+    t2.groupby(["year", "period_num", "period"], observed=True, as_index=False)
     .agg(
         avg_approved_amount=("approved_amount", "mean"),
         avg_used_amount=("dollars_used", "mean"),
     )
-    .sort_values("bucket")
+    .sort_values(["year", "period_num"])
 )
 
 sp_l, t2c1, t2c2, sp_r = st.columns([0.25, 1, 1, 0.25])
@@ -407,22 +409,38 @@ sp_l, t2c1, t2c2, sp_r = st.columns([0.25, 1, 1, 0.25])
 with t2c1:
     with st.container(border=True):
         st.markdown("### Avg Approved Amount")
-        fig = px.line(t2, x="bucket", y="avg_approved_amount", markers=True)
-        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
+        fig = px.line(
+            t2_agg,
+            x="period",
+            y="avg_approved_amount",
+            color="year",
+            markers=True,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
+        )
+        fig.update_layout(height=360, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 with t2c2:
     with st.container(border=True):
         st.markdown("### Avg Used Amount")
-        fig = px.line(t2, x="bucket", y="avg_used_amount", markers=True)
-        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
+        fig = px.line(
+            t2_agg,
+            x="period",
+            y="avg_used_amount",
+            color="year",
+            markers=True,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
+        )
+        fig.update_layout(height=360, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
 
 # =========================================================
-# TASK 3 — Store metrics + bonus viz
+# TASK 3
 # =========================================================
 st.subheader("Task 3 — Metrics by Store (Funnel Rates)")
 
@@ -442,19 +460,9 @@ by_store = (
     )
 )
 
-by_store["approval_rate"] = by_store.apply(lambda r: safe_pct(r["approved"], r["applications"]), axis=1)
-by_store["completion_rate"] = by_store.apply(lambda r: safe_pct(r["used"], r["approved"]), axis=1)
-by_store["conversion_rate"] = by_store.apply(lambda r: safe_pct(r["used"], r["applications"]), axis=1)
-
-by_store = by_store[
-    [
-        "store", "state", "industry", "size",
-        "applications", "approved", "used",
-        "approval_rate", "completion_rate", "conversion_rate",
-        "total_approved_amount", "total_used_amount",
-        "avg_approved_amount", "avg_used_amount",
-    ]
-].sort_values("applications", ascending=False)
+by_store["approval_rate"] = safe_div_series(by_store["approved"], by_store["applications"])
+by_store["completion_rate"] = safe_div_series(by_store["used"], by_store["approved"])
+by_store["conversion_rate"] = safe_div_series(by_store["used"], by_store["applications"])
 
 display_store = by_store.copy()
 display_store["approval_rate"] = display_store["approval_rate"].map(lambda x: f"{x:.1%}")
@@ -465,57 +473,93 @@ display_store["total_used_amount"] = display_store["total_used_amount"].map(fmt_
 display_store["avg_approved_amount"] = display_store["avg_approved_amount"].map(fmt_money)
 display_store["avg_used_amount"] = display_store["avg_used_amount"].map(fmt_money)
 
-st.dataframe(display_store, use_container_width=True, height=460)
+st.dataframe(
+    display_store.sort_values("applications", ascending=False),
+    use_container_width=True,
+    height=460,
+)
 
-st.subheader("Percentages trends over time (Bonus Viz)")
+st.subheader("Percentages trends over time")
 
-funnel_trends = (
-    f.groupby("bucket", as_index=False)
+ft = add_time_cols(f, "submit_date", trend_granularity)
+years_to_show_ft = pick_yoy_years(ft["year"].unique().tolist())
+ft = ft[ft["year"].isin(years_to_show_ft)].copy()
+ft["year"] = pd.Categorical(ft["year"], categories=years_to_show_ft, ordered=True)
+
+ft_agg = (
+    ft.groupby(["year", "period_num", "period"], observed=True, as_index=False)
     .agg(
         applications=("application_id", "count"),
         approved=("is_approved", "sum"),
         used=("is_used", "sum"),
     )
-    .sort_values("bucket")
+    .sort_values(["year", "period_num"])
 )
 
-funnel_trends["approval_rate"] = safe_div_series(funnel_trends["approved"], funnel_trends["applications"])
-funnel_trends["completion_rate"] = safe_div_series(funnel_trends["used"], funnel_trends["approved"])
-funnel_trends["conversion_rate"] = safe_div_series(funnel_trends["used"], funnel_trends["applications"])
+ft_agg["approval_rate"] = safe_div_series(ft_agg["approved"], ft_agg["applications"])
+ft_agg["completion_rate"] = safe_div_series(ft_agg["used"], ft_agg["approved"])
+ft_agg["conversion_rate"] = safe_div_series(ft_agg["used"], ft_agg["applications"])
 
 g1, g2, g3 = st.columns(3)
 
 with g1:
     with st.container(border=True):
         st.markdown("### Approval Rate")
-        fig = px.line(funnel_trends, x="bucket", y="approval_rate", markers=True)
-        fig.update_layout(height=260, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=10, b=10))
+        fig = px.line(
+            ft_agg,
+            x="period",
+            y="approval_rate",
+            color="year",
+            markers=True,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
+        )
+        fig.update_yaxes(tickformat=".0%")
+        fig.update_layout(height=260, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 with g2:
     with st.container(border=True):
         st.markdown("### Completion Rate")
-        fig = px.line(funnel_trends, x="bucket", y="completion_rate", markers=True)
-        fig.update_layout(height=260, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=10, b=10))
+        fig = px.line(
+            ft_agg,
+            x="period",
+            y="completion_rate",
+            color="year",
+            markers=True,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
+        )
+        fig.update_yaxes(tickformat=".0%")
+        fig.update_layout(height=260, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 with g3:
     with st.container(border=True):
         st.markdown("### Conversion Rate")
-        fig = px.line(funnel_trends, x="bucket", y="conversion_rate", markers=True)
-        fig.update_layout(height=260, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=10, b=10))
+        fig = px.line(
+            ft_agg,
+            x="period",
+            y="conversion_rate",
+            color="year",
+            markers=True,
+            category_orders=period_category_orders,
+            color_discrete_map=YEAR_COLOR_MAP,
+        )
+        fig.update_yaxes(tickformat=".0%")
+        fig.update_layout(height=260, hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
 
 # =========================================================
-# TASK 4 — Marketing performance + Efficiency (ratio, NOT %)
+# TASK 4 — remove "No Campaign" from both charts
 # =========================================================
 st.subheader("Task 4 — Used Dollars vs Marketing Spend (by Campaign)")
 
 if "campaign_name" not in f.columns:
-    st.info("Campaign data not available (marketing merge not present).")
+    st.info("Campaign data not available.")
 else:
     mkt = (
         f.groupby("campaign_name", as_index=False)
@@ -524,20 +568,30 @@ else:
             spend=("campaign_spend", "first"),
         )
     )
-    mkt["campaign_name"] = mkt["campaign_name"].fillna("Unknown / Unmapped")
+
+    # remove missing AND "No Campaign"/unknown labels
+    mkt = mkt[mkt["campaign_name"].notna()].copy()
+    mkt = mkt[
+        ~mkt["campaign_name"].astype(str).str.strip().str.lower().isin(
+            ["no campaign", "unknown / unmapped", "unknown", "unmapped", "nan", ""]
+        )
+    ].copy()
+
     mkt["spend"] = pd.to_numeric(mkt["spend"], errors="coerce").fillna(0.0)
     mkt["used_dollars"] = pd.to_numeric(mkt["used_dollars"], errors="coerce").fillna(0.0)
 
-    # Add synthetic campaign: Radio Ads (spend=682,820, used=0)
+    # Add "Radio Ads" at the end
     if "Radio Ads" not in set(mkt["campaign_name"].astype(str)):
-        radio_ads = pd.DataFrame({"campaign_name": ["Radio Ads"], "used_dollars": [0.0], "spend": [682_820.0]})
-        mkt = pd.concat([mkt, radio_ads], ignore_index=True)
+        mkt = pd.concat(
+            [mkt, pd.DataFrame({"campaign_name": ["Radio Ads"], "used_dollars": [0.0], "spend": [682_820.0]})],
+            ignore_index=True,
+        )
 
-    # Ensure Radio Ads appears at the END
+    # Ensure Radio Ads appears at end
     mkt["__radio_last"] = np.where(mkt["campaign_name"] == "Radio Ads", 1, 0)
     mkt = mkt.sort_values(["__radio_last", "spend"], ascending=[True, False]).drop(columns="__radio_last")
 
-    # Chart 1: Spend vs Used
+    # Graph 1: Spend vs Used
     mkt_long = mkt.melt(
         id_vars=["campaign_name"],
         value_vars=["used_dollars", "spend"],
@@ -556,7 +610,7 @@ else:
     fig4.update_layout(xaxis_title="Campaign", yaxis_title="Amount", xaxis={"tickangle": -30})
     st.plotly_chart(fig4, use_container_width=True)
 
-    # Chart 2: Efficiency ratio = Used / Spend
+    # Graph 2: Efficiency (ratio, NOT %)
     mkt["efficiency"] = np.where(mkt["spend"] > 0, mkt["used_dollars"] / mkt["spend"], 0.0)
 
     with st.container(border=True):
@@ -581,88 +635,188 @@ st.divider()
 
 
 # =========================================================
-# TASK 5 — Insight (Lease grade trend + State map)
+# TASK 5 — Statewise + Lease Grade
 # =========================================================
-st.subheader("Task 5 — Insight")
+st.subheader("Task 5 — Statewise Distribution")
 
-f["state_abbr"] = normalize_state_to_abbr(f["state"]) if "state" in f.columns else np.nan
-
-statewise = (
-    f.dropna(subset=["state_abbr"])
-    .groupby("state_abbr", as_index=False)
-    .agg(
-        applications=("application_id", "count"),
-        approved=("is_approved", "sum"),
-        used=("is_used", "sum"),
-        total_approved_amount=("approved_amount", "sum"),
-        total_used_amount=("dollars_used", "sum"),
+if "state_abbr" not in f.columns:
+    st.info("State data not available.")
+else:
+    statewise = (
+        f.dropna(subset=["state_abbr"])
+        .groupby("state_abbr", as_index=False)
+        .agg(
+            applications=("application_id", "count"),
+            approved=("is_approved", "sum"),
+            used=("is_used", "sum"),
+            total_approved_amount=("approved_amount", "sum"),
+            total_used_amount=("dollars_used", "sum"),
+        )
     )
+
+    statewise["approval_rate"] = safe_div_series(statewise["approved"], statewise["applications"])
+    statewise["utilization_rate"] = safe_div_series(statewise["used"], statewise["applications"])
+
+    map_mode = st.selectbox(
+        "Map Metric",
+        [
+            "applications",
+            "approved",
+            "used",
+            "approval_rate",
+            "utilization_rate",
+            "total_used_amount",
+            "total_approved_amount",
+        ],
+        index=0,
+        key="map_metric_task5",
+    )
+
+    fig_map = px.choropleth(
+        statewise,
+        locations="state_abbr",
+        locationmode="USA-states",
+        color=map_mode,
+        scope="usa",
+        color_continuous_scale="Blues",  # dark = high, light = low
+        labels={map_mode: map_mode.replace("_", " ").title()},
+    )
+
+    if map_theme == "Dark":
+        fig_map.update_layout(template="plotly_dark")
+
+    fig_map.update_layout(height=650, margin=dict(l=5, r=5, t=25, b=5))
+    st.plotly_chart(fig_map, use_container_width=True)
+
+
+# --- Lease grade share over time (stacked) ---
+st.subheader("Trends over time by Lease Grade (Share of total)")
+
+if "lease_grade" not in f.columns:
+    st.info("lease_grade column not available in applications sheet.")
+else:
+    lg = f.copy()
+    lg["lease_grade"] = lg["lease_grade"].astype(str).str.strip().str.upper()
+    lg = lg[lg["lease_grade"].notna() & (lg["lease_grade"] != "")].copy()
+
+    lg = add_time_cols(lg, "submit_date", trend_granularity)
+
+    basis = st.selectbox(
+        "Basis",
+        ["Applications", "Approved", "Used"],
+        index=0,
+        key="lease_grade_basis",
+    )
+
+    if basis == "Applications":
+        lg["basis_flag"] = 1
+    elif basis == "Approved":
+        lg["basis_flag"] = lg["is_approved"].astype(int)
+    else:
+        lg["basis_flag"] = lg["is_used"].astype(int)
+
+    lg_agg = (
+        lg.groupby(["year", "period_num", "period", "lease_grade"], observed=True, as_index=False)
+        .agg(count=("basis_flag", "sum"))
+        .sort_values(["year", "period_num"])
+    )
+
+    # Share within each (year, period)
+    lg_agg["total_in_bucket"] = lg_agg.groupby(["year", "period_num"], observed=True)["count"].transform("sum")
+    lg_agg["share"] = np.where(lg_agg["total_in_bucket"] > 0, lg_agg["count"] / lg_agg["total_in_bucket"], 0.0)
+
+    fig_lg = px.bar(
+        lg_agg,
+        x="period",
+        y="share",
+        color="lease_grade",
+        facet_col="year",
+        barmode="stack",
+        category_orders=period_category_orders,
+        labels={"share": "Share", "lease_grade": "Lease Grade"},
+    )
+
+    fig_lg.update_yaxes(tickformat=".0%")
+    fig_lg.update_layout(height=420, margin=dict(l=10, r=10, t=70, b=10))
+    st.plotly_chart(fig_lg, use_container_width=True)
+
+# --- Approval Rate by Lease Grade (Split by Year) ---
+st.subheader("Approval Rate by Lease Grade (by Year)")
+
+if "lease_grade" not in f.columns:
+    st.info("lease_grade column not available in applications sheet.")
+else:
+    lg2 = f.copy()
+    lg2["lease_grade"] = lg2["lease_grade"].astype(str).str.strip().str.upper()
+    lg2 = lg2[lg2["lease_grade"].notna() & (lg2["lease_grade"] != "")].copy()
+
+    # Keep only years used elsewhere (consistent with YoY logic)
+    years_to_show = pick_yoy_years(lg2["submit_date"].dt.year.astype(str).unique().tolist())
+    lg2["year"] = lg2["submit_date"].dt.year.astype(str)
+    lg2 = lg2[lg2["year"].isin(years_to_show)]
+
+    # Aggregate
+    ar = (
+        lg2.groupby(["year", "lease_grade"], as_index=False)
+        .agg(
+            applications=("application_id", "count"),
+            approved=("is_approved", "sum"),
+        )
+    )
+
+    ar["approval_rate"] = np.where(
+        ar["applications"] > 0,
+        ar["approved"] / ar["applications"],
+        0.0,
+    )
+
+    # Enforce logical lease grade order
+    grade_order = [g for g in ["A", "B", "C", "D", "F"] if g in set(ar["lease_grade"])]
+    others = sorted([g for g in ar["lease_grade"].unique() if g not in grade_order])
+    ar["lease_grade"] = pd.Categorical(ar["lease_grade"], categories=grade_order + others, ordered=True)
+
+    # Plot
+    fig_ar = px.bar(
+        ar,
+        x="lease_grade",
+        y="approval_rate",
+        facet_col="year",
+        color="year",
+        text=ar["approval_rate"].map(lambda x: f"{x:.1%}"),
+        category_orders={"lease_grade": grade_order + others},
+        color_discrete_map=YEAR_COLOR_MAP,
+        labels={
+            "lease_grade": "Lease Grade",
+            "approval_rate": "Approval Rate",
+            "year": "Year",
+        },
+    )
+
+    fig_ar.update_yaxes(tickformat=".0%")
+    fig_ar.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=50, b=10),
+        showlegend=False,  # legend redundant due to facets
+    )
+
+    # Clean facet titles: "year=2022" → "2022"
+    fig_ar.for_each_annotation(lambda a: a.update(text=a.text.replace("year=", "")))
+
+    st.plotly_chart(fig_ar, use_container_width=True)
+st.markdown("---")
+st.markdown("### 🧾 Executive Summary — Task 5")
+
+st.markdown(
+    """
+- **Lease grade is the dominant driver of approval performance.**  
+  Approval rates decline predictably from **Grade A to F** across both 2022 and 2023, confirming lease grade as a reliable and stable risk segmentation signal in underwriting decisions.
+
+- **Year-over-year shifts indicate evolving credit risk appetite.**  
+  Differences between **2022 and 2023** approval rates, particularly for lower lease grades, suggest a tightening or recalibration of approval thresholds while higher-quality segments remain largely insulated.
+
+- **Geographic volume and utilization reveal targeted growth opportunities.**  
+  State-level patterns show that high application or approval volume does not always convert to usage, highlighting opportunities to optimize post-approval conversion and regional strategy without increasing credit risk.
+"""
 )
-statewise["approval_rate"] = safe_div_series(statewise["approved"], statewise["applications"])
-statewise["utilization_rate"] = safe_div_series(statewise["used"], statewise["applications"])
 
-left5, right5 = st.columns([1.15, 0.85])
-
-with left5:
-    with st.container(border=True):
-        st.markdown("### Trends over time by Lease Grade (Stacked Applications)")
-
-        if "lease_grade" not in f.columns:
-            st.info("lease_grade column not found in the dataset.")
-        else:
-            lg_trend = (
-                f.dropna(subset=["lease_grade", "bucket"])
-                .groupby(["bucket", "lease_grade"], as_index=False)
-                .agg(applications=("application_id", "count"))
-                .sort_values("bucket")
-            )
-
-            fig_lg = px.bar(
-                lg_trend,
-                x="bucket",
-                y="applications",
-                color="lease_grade",
-                barmode="stack",
-            )
-            fig_lg.update_layout(
-                height=520,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Submission Date",
-                yaxis_title="Applications",
-            )
-            st.plotly_chart(fig_lg, use_container_width=True)
-
-with right5:
-    with st.container(border=True):
-        st.markdown("### Statewise Distribution")
-
-        map_mode = st.selectbox(
-            "Map Metric",
-            [
-                "applications",
-                "approved",
-                "used",
-                "approval_rate",
-                "utilization_rate",
-                "total_used_amount",
-                "total_approved_amount",
-            ],
-            index=0,
-            key="map_metric_task5",
-        )
-
-        fig_map = px.choropleth(
-            statewise,
-            locations="state_abbr",
-            locationmode="USA-states",
-            color=map_mode,
-            scope="usa",
-            color_continuous_scale="Blues",  # low=light, high=dark
-            labels={map_mode: map_mode.replace("_", " ").title()},
-        )
-
-        if map_theme == "Dark":
-            fig_map.update_layout(template="plotly_dark")
-
-        fig_map.update_layout(height=520, margin=dict(l=5, r=5, t=25, b=5))
-        st.plotly_chart(fig_map, use_container_width=True)
+    
